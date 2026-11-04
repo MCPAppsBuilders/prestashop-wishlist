@@ -1,0 +1,152 @@
+<?php
+
+namespace Summit\Wishlist\Presenter;
+
+use Context;
+use Db;
+use PrestaShop\PrestaShop\Adapter\Image\ImageRetriever;
+use PrestaShop\PrestaShop\Adapter\Presenter\Product\ProductListingPresenter;
+use PrestaShop\PrestaShop\Adapter\Product\PriceFormatter;
+use PrestaShop\PrestaShop\Adapter\Product\ProductColorsRetriever;
+use ProductAssembler;
+use ProductPresenterFactory;
+use Summit\Wishlist\Catalog\ProductCatalogInterface;
+use Summit\Wishlist\Service\WishlistService;
+
+/**
+ * Turns wishlist rows into template data with live name, image, price and availability
+ * in the current shop, language, currency and customer context. Prices are never stored.
+ */
+class WishlistPresenter
+{
+    /** @var Context */
+    private $context;
+    /** @var WishlistService */
+    private $service;
+    /** @var ProductCatalogInterface */
+    private $catalog;
+
+    public function __construct(Context $context, WishlistService $service, ProductCatalogInterface $catalog)
+    {
+        $this->context = $context;
+        $this->service = $service;
+        $this->catalog = $catalog;
+    }
+
+    /**
+     * @param array[] $items rows from the wishlist item table
+     *
+     * @return array[]
+     */
+    public function present(array $items): array
+    {
+        if (!$items) {
+            return [];
+        }
+
+        $existing = $this->existingProductIds(array_column($items, 'id_product'));
+        $presented = $this->presentProducts(array_filter($items, static function (array $item) use ($existing) {
+            return isset($existing[(int) $item['id_product']]);
+        }));
+
+        $rows = [];
+        foreach ($items as $item) {
+            $itemId = (int) $item['id_wishlist_product'];
+            $productId = (int) $item['id_product'];
+            $attributeId = (int) $item['id_product_attribute'];
+            $product = $presented[$itemId] ?? null;
+
+            if ($product === null) {
+                $rows[] = [
+                    'id' => $itemId,
+                    'name' => $item['fallback_name'],
+                    'combination' => '',
+                    'url' => null,
+                    'image' => null,
+                    'price' => null,
+                    'status' => 'unavailable',
+                ];
+                continue;
+            }
+
+            $rows[] = [
+                'id' => $itemId,
+                'name' => $product['name'],
+                'combination' => $this->catalog->combinationLabel($productId, $attributeId),
+                'url' => $product['url'],
+                'image' => $this->imageUrl($product['cover'] ?? null),
+                'price' => !empty($product['show_price']) ? $product['price'] : null,
+                'status' => $this->service->availability($productId, $attributeId),
+            ];
+        }
+
+        return $rows;
+    }
+
+    /**
+     * @param int[] $productIds
+     *
+     * @return array<int, true> product IDs that still exist in the current shop
+     */
+    private function existingProductIds(array $productIds): array
+    {
+        $productIds = array_values(array_unique(array_map('intval', $productIds)));
+        $rows = Db::getInstance()->executeS(
+            'SELECT `id_product` FROM `' . _DB_PREFIX_ . 'product_shop`
+            WHERE `id_shop` = ' . (int) $this->context->shop->id . '
+              AND `id_product` IN (' . implode(',', $productIds) . ')',
+            true,
+            false
+        ) ?: [];
+
+        return array_fill_keys(array_map('intval', array_column($rows, 'id_product')), true);
+    }
+
+    /**
+     * Batch-assembles and presents products the same way core listing modules do.
+     *
+     * @return array<int, mixed> presented product keyed by wishlist item ID
+     */
+    private function presentProducts(array $items): array
+    {
+        if (!$items) {
+            return [];
+        }
+
+        $rawProducts = [];
+        $itemIds = [];
+        foreach ($items as $item) {
+            $rawProducts[] = [
+                'id_product' => (int) $item['id_product'],
+                'id_product_attribute' => (int) $item['id_product_attribute'],
+            ];
+            $itemIds[] = (int) $item['id_wishlist_product'];
+        }
+
+        $assembler = new ProductAssembler($this->context);
+        $settings = (new ProductPresenterFactory($this->context))->getPresentationSettings();
+        $presenter = new ProductListingPresenter(
+            new ImageRetriever($this->context->link),
+            $this->context->link,
+            new PriceFormatter(),
+            new ProductColorsRetriever(),
+            $this->context->getTranslator()
+        );
+
+        $presented = [];
+        foreach ($assembler->assembleProducts($rawProducts) as $index => $rawProduct) {
+            $presented[$itemIds[$index]] = $presenter->present($settings, $rawProduct, $this->context->language);
+        }
+
+        return $presented;
+    }
+
+    private function imageUrl($cover): ?string
+    {
+        if (!$cover) {
+            return null;
+        }
+
+        return $cover['bySize']['home_default']['url'] ?? $cover['medium']['url'] ?? null;
+    }
+}
